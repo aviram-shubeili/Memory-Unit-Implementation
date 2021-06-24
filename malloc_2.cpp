@@ -162,6 +162,7 @@ void* srealloc(void* oldp, size_t new_size) {
     if (newp == nullptr) {
         return nullptr;
     }
+    memcpy(newp, oldp, oldp_metadata->size);
     /* Free old */
     sfree(oldp);
 
