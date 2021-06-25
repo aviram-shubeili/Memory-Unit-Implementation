@@ -100,6 +100,10 @@ MallocMetaData *BlockMetaDataList::searchFreeBlock(size_t size) {
 }
 
 void BlockMetaDataList::freeBlock(MallocMetaData *p) {
+    /*If already free -> do nothing */
+    if(p->is_free) {
+        return;
+    }
     p->is_free = true;
     num_free_blocks++;
     num_free_bytes += p->size;
@@ -120,7 +124,10 @@ void* smalloc(size_t size) {
     if(block_metadata == nullptr) {
         return nullptr;
     }
-    return (void*)(block_metadata + sizeof(MallocMetaData));
+    size_t t = sizeof(MallocMetaData);
+    char* p1 = (char*)(block_metadata);
+    void* p = (void*)(p1 + sizeof(MallocMetaData));
+    return p;
 }
 
 void* scalloc(size_t num, size_t size) {
@@ -128,7 +135,8 @@ void* scalloc(size_t num, size_t size) {
     if(block_metadata == nullptr) {
         return nullptr;
     }
-    void* block = (void*)(block_metadata + sizeof(MallocMetaData));
+    char* p1 = (char*)(block_metadata);
+    void* block = (void*)(p1 + sizeof(MallocMetaData));
     /* Making a zeroes block */
     memset(block,0,size*num);
     return block;
