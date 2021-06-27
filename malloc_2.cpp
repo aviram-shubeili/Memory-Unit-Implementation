@@ -124,7 +124,6 @@ void* smalloc(size_t size) {
     if(block_metadata == nullptr) {
         return nullptr;
     }
-    size_t t = sizeof(MallocMetaData);
     char* p1 = (char*)(block_metadata);
     void* p = (void*)(p1 + sizeof(MallocMetaData));
     return p;
