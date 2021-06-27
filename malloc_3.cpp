@@ -8,6 +8,10 @@
 #define MMAP_BIN 128
 #define COMBINED_LIST (-1)
 #define WILDERNESS combined_list_tail
+#define DISABLE_WILDERNESS_EXTEND 0
+#define ENABLE_WILDERNESS_EXTEND 1
+#define DONT_MERGE 0
+#define MERGE 1
 
 /**
  * This is a metadata used to manage the allocated blocks in a linked list
@@ -20,6 +24,7 @@ struct MallocMetaData    {
     MallocMetaData* next_in_bin;
     MallocMetaData* prev_in_bin;
 };
+bool checkSplit(MallocMetaData *block, size_t new_size);
 /**
  * This is a class that handles the meta data list of blocks
  */
@@ -38,14 +43,14 @@ public:
     bool isEmpty(int i) const;
     bool isSingleBlock(int i) const;
     int getBinIndex(size_t size);
-    MallocMetaData* allocateBlock(size_t size);
+    MallocMetaData *allocateBlock(size_t size, int flag);
     MallocMetaData* searchFreeBlock(size_t size);
     void insertBlockToBinList(MallocMetaData* block);
     void removeFromBinList(MallocMetaData *block);
     void removeFromCombinedList(MallocMetaData *block);
     void insertToCombinedList(MallocMetaData* block);
     void insertAfterToCombinedList(MallocMetaData* left, MallocMetaData* new_block);
-    void freeBlock(MallocMetaData* p);
+    void freeBlock(MallocMetaData *p, int merge_flag = MERGE);
     void occupyBlock(MallocMetaData* p);
     void mergeFreeBlocks(MallocMetaData* middle);
     void mergeLeftAndFree(MallocMetaData* left, MallocMetaData* middle);
@@ -57,13 +62,20 @@ public:
 
     void mergeLeft(MallocMetaData *left, MallocMetaData *middle);
 };
+
+bool checkSplit(MallocMetaData *block, size_t new_size);
+
+bool checkMergeLeft(MallocMetaData *block, size_t new_size);
+bool checkMergeRight(MallocMetaData *block, size_t new_size);
+bool checkMergeBoth(MallocMetaData *block, size_t new_size);
+
 /**
  * Search for a free block in list that is compatible or allocates and inserts a new block to the end of the list
  * @param size
  * @return nullptr if there is not a compatible block and sbrk() fails to add another block. (or size is 0 / bigger than 1e8)
  */
-MallocMetaData* BlockMetaDataList::allocateBlock(size_t size) {
-    if(size == 0 or size > 1e8) {
+MallocMetaData * BlockMetaDataList::allocateBlock(size_t size, int flag) {
+    if(size <= 0 or size > 1e8) {
         return nullptr;
     }
     if(getBinIndex(size) == MMAP_BIN) {
@@ -86,12 +98,22 @@ MallocMetaData* BlockMetaDataList::allocateBlock(size_t size) {
     MallocMetaData* block = searchFreeBlock(size);
     if(block != nullptr) {
         occupyBlock(block);
-        MallocMetaData* splitted_block = splitBlock(block, size);
-        return splitted_block;
+        if(checkSplit(block,size)) {
+            block = splitBlock(block, size);
+        }
+        return block;
     }
     /* B. Trying to expand wilderness */
-    if(WILDERNESS and WILDERNESS->is_free) {
-        return expandAndOccupyWilderness(size);
+    if(flag == ENABLE_WILDERNESS_EXTEND or (WILDERNESS and WILDERNESS->is_free)) {
+        WILDERNESS->is_free = true; // for occupying reasons
+        if(flag == ENABLE_WILDERNESS_EXTEND) {
+            // countering decrement in occupy Function
+            num_free_blocks++;
+            num_free_bytes += WILDERNESS->size;
+        }
+        block = expandAndOccupyWilderness(size);
+        block->is_free = false;
+        return block;
     }
     /* C. Allocating a new block */
     void* addr = sbrk(sizeof(MallocMetaData) + size);
@@ -132,7 +154,7 @@ MallocMetaData *BlockMetaDataList::searchFreeBlock(size_t size) {
     return nullptr;
 }
 
-void BlockMetaDataList::freeBlock(MallocMetaData *p) {
+void BlockMetaDataList::freeBlock(MallocMetaData *p, int merge_flag) {
     if(p->is_free) {
         return;
     }
@@ -140,14 +162,18 @@ void BlockMetaDataList::freeBlock(MallocMetaData *p) {
 //    std::cout << "Freeing p at size: " <<  p->size << "\n";
     int i = getBinIndex(p->size);
     if(i == MMAP_BIN) {
+        total_blocks--;
+        total_bytes -= p->size;
         munmap(p, sizeof(MallocMetaData) + p->size);
         return;
     }
     p->is_free = true;
     num_free_blocks++;
     num_free_bytes += p->size;
-    insertBlockToBinList(p); // FixMe bin for free only
-    mergeFreeBlocks(p);
+    insertBlockToBinList(p);
+    if(merge_flag == MERGE) {
+        mergeFreeBlocks(p);
+    }
 }
 
 bool BlockMetaDataList::isEmpty(int i) const {
@@ -197,7 +223,7 @@ void BlockMetaDataList::insertBlockToBinList(MallocMetaData *block) {
         /* Find the first block smaller in size than me (or nullptr if none exist) */
         MallocMetaData* insert_before_me = head[i];
         while(insert_before_me and insert_before_me->size < block->size) {
-            insert_before_me = insert_before_me->next;
+            insert_before_me = insert_before_me->next_in_bin;
         }
         /*Inserting in the middle of the list */
         if(insert_before_me) {
@@ -208,6 +234,7 @@ void BlockMetaDataList::insertBlockToBinList(MallocMetaData *block) {
                 head[i]->prev_in_bin = block;
                 block->next_in_bin = head[i];
                 head[i] = block;
+                return;
             }
             /* READ THE FOLLOWING COMMENTS WITH THE VOICE AND TUNE OF JOEY IN "The One in Vegas: Part2 */
             /* Link: */ https://youtu.be/6OZoP2iWpnU?t=45 */
@@ -268,7 +295,6 @@ void BlockMetaDataList::insertToCombinedList(MallocMetaData *block) {
         block->next = nullptr;
         combined_list_tail = block;
     }
-    // TODO maybe update stats here?
 }
 
 MallocMetaData * BlockMetaDataList::expandAndOccupyWilderness(size_t size) {
@@ -278,55 +304,33 @@ MallocMetaData * BlockMetaDataList::expandAndOccupyWilderness(size_t size) {
         return nullptr;
     }
     total_bytes += expansion_size;
-    WILDERNESS->size = size;
+
     occupyBlock(WILDERNESS);
+    WILDERNESS->size = size;
     return WILDERNESS;
 }
 
 void BlockMetaDataList::mergeFreeBlocks(MallocMetaData *middle) {
     MallocMetaData* prev = middle->prev;
     MallocMetaData* next = middle->next;
-    if(prev and prev->is_free) {
-        if (next and next->is_free) {
-            mergeRight(middle, next);
-            mergeLeft(prev, middle);
-            // TODO is right and left replace code below?
-            /*
-            removeFromBinList(prev);
-            removeFromBinList(middle);
-            removeFromBinList(next);
-            removeFromCombinedList(middle);
-            removeFromCombinedList(next);
-            //prev will remain as the new block
-            prev->size += middle->size;
-            prev->size += next->size;
-            // TODO stats?
-            total_blocks -=2;
-            insertBlockToBinList(prev);
-            */
-            return;
-        }
-        else {
-            mergeLeft(prev, middle);
-            return;
-        }
-    }
-    else if(next and next->is_free) {
+    if (next and next->is_free) {
         mergeRight(middle, next);
-        return;
+        if(prev and prev->is_free) {
+            mergeLeft(prev, middle);
+            return;
+        }
     }
-    else {
-        return;
+    if (prev and prev->is_free) {
+        mergeLeft(prev, middle);
     }
-
 }
 
 void BlockMetaDataList::removeFromBinList(MallocMetaData *block) {
     /* if block  is not free its already  not in  bin's list */
-    if(not block->is_free) {
-        return;
-    }
+    assert(block->is_free && "UNEXPECTED ERROR:: removeFromBinList: unfree block");
+
     int i = getBinIndex(block->size);
+    assert(i != MMAP_BIN);
     // block is the only one in list
     if(isSingleBlock(i)) {
         /* block is not in bin list */
@@ -386,31 +390,32 @@ void BlockMetaDataList::removeFromCombinedList(MallocMetaData *block) {
 }
 
 MallocMetaData *BlockMetaDataList::splitBlock(MallocMetaData *block, size_t first_block_size) {
-    assert(not block->is_free);
-    /* There isn't enough room to split */
-    if(block->size <= first_block_size + sizeof(MallocMetaData)) {
-        return block;
-    }
+    assert(block and not block->is_free && "Trying to split a free block");
+
+    // TODO:: Check outside if split is allowed
+
 
     /* Skipping first block meta data and size and setting the new block meta data */
-    char* ptr = (char*)(block + sizeof(MallocMetaData) + first_block_size);
-    MallocMetaData* second_block = (MallocMetaData*)(ptr);
-    second_block->size = block->size - first_block_size - sizeof(MallocMetaData);
-//    second_block->is_free = true;
+//    void* p = (p1 + first_block_size + sizeof(MallocMetaData));
+    char* p1 = (char*)(block);
+    MallocMetaData* second_block = (MallocMetaData*)(p1 + first_block_size );
+
 
     /* update size */
+    second_block->size = block->size - first_block_size - sizeof(MallocMetaData);
     block->size = first_block_size;
-
-    /* Insert both new blocks to the bin list */
-    freeBlock(second_block);
+    second_block->is_free = false; // for freeing reasons
+    second_block->next = second_block->prev = second_block->next_in_bin = second_block->prev_in_bin = nullptr;
 
     /* Insert the second block after the first block in the combined list (sorted by addresses) */
     insertAfterToCombinedList(block, second_block);
-
-    // Making sure we arent leaving any 2 adjacent free blocks
-    if(second_block->next and second_block->next->is_free) {
-        mergeRight(second_block, second_block->next);
-    }
+    total_blocks++;
+    total_bytes -= sizeof(MallocMetaData);
+    /* Insert new block to the bin list */
+    /* Weird choice not to merge but according to piazza @622
+     * https://piazza.com/class/kmeyq2ecrv940z?cid=622
+     * */
+    freeBlock(second_block, DONT_MERGE);
 
     return block;
 }
@@ -446,26 +451,44 @@ void BlockMetaDataList::mergeLeftAndFree(MallocMetaData *left, MallocMetaData *m
 //    insertBlockToBinList(left);
 }
 void BlockMetaDataList::mergeLeft(MallocMetaData *left, MallocMetaData *middle) {
-    assert(middle->is_free);
-
-    //    removeFromBinList(left);
-//    removeFromBinList(middle);
+    assert(left and left->is_free and "UNEXPECTED ERROR:: mergeLeft: merging left to unfree");
+    if(middle->is_free) {
+        removeFromBinList(middle);
+        num_free_blocks--;
+        num_free_bytes += sizeof(MallocMetaData); // result of merge
+    }
+    else {
+        num_free_bytes += middle->size + sizeof(MallocMetaData);
+    }
+    total_bytes += sizeof(MallocMetaData);
     removeFromCombinedList(middle);
+    total_blocks--;
     /*prev will remain as the new block */
+    removeFromBinList(left);
     left->size += middle->size + sizeof(MallocMetaData);
-
-//    insertBlockToBinList(left);
+    left->is_free = false;
+    insertBlockToBinList(left); // inserting to the right bin (after size change)
+    left->is_free = true;
 }
 void BlockMetaDataList::mergeRight(MallocMetaData *middle, MallocMetaData *right) {
-    assert(middle->is_free);
-//    freeBlock(middle);
-//    removeFromBinList(middle);
-//    removeFromBinList(right);
+    assert(right and right->is_free and "UNEXPECTED ERROR:: mergeRight: merging right to unfree");
+    if(middle->is_free) {
+        removeFromBinList(middle);
+        num_free_blocks--;
+        num_free_bytes += sizeof(MallocMetaData); // result of merge
+    }
+    else {
+        middle->is_free = false;
+        num_free_bytes += middle->size + sizeof(MallocMetaData);
+    }
+    total_bytes += sizeof(MallocMetaData);
+    removeFromBinList(right);
     removeFromCombinedList(right);
-    /*middle will remain as the new block */
+    total_blocks--;
     middle->size += right->size + sizeof(MallocMetaData);
-
-//    insertBlockToBinList(middle);
+    /*middle will remain as the new block */
+    insertBlockToBinList(middle);
+    middle->is_free = true;
 }
 
 void BlockMetaDataList::mergeRightAndFree(MallocMetaData *middle, MallocMetaData *right) {
@@ -484,10 +507,10 @@ void BlockMetaDataList::occupyBlock(MallocMetaData *p) {
     int i = getBinIndex(p->size);
     // should never get here
     assert(i != MMAP_BIN);
-    p->is_free = false;
     num_free_blocks--;
     num_free_bytes -= p->size;
     removeFromBinList(p);
+    p->is_free = false;
 }
 
 BlockMetaDataList meta_list;
@@ -495,7 +518,7 @@ BlockMetaDataList mmap_meta_list;
 
 void* smalloc(size_t size) {
 
-    MallocMetaData* block_metadata = meta_list.allocateBlock(size);
+    MallocMetaData* block_metadata = meta_list.allocateBlock(size, DISABLE_WILDERNESS_EXTEND);
     if(block_metadata == nullptr) {
         return nullptr;
     }
@@ -505,7 +528,7 @@ void* smalloc(size_t size) {
 }
 
 void* scalloc(size_t num, size_t size) {
-    MallocMetaData* block_metadata = meta_list.allocateBlock(size * num);
+    MallocMetaData* block_metadata = meta_list.allocateBlock(size * num, DISABLE_WILDERNESS_EXTEND);
     if(block_metadata == nullptr) {
         return nullptr;
     }
@@ -532,96 +555,137 @@ void* srealloc(void* oldp, size_t new_size) {
     if (oldp == nullptr) {
         return smalloc(new_size);
     }
-    if (new_size == 0) {
-        return oldp;
+    if (new_size == 0 or new_size > 1e8) {
+        return nullptr;
     }
+
     char *p1 = (char *) (oldp);
     MallocMetaData *oldp_metadata = (MallocMetaData *) (p1 - sizeof(MallocMetaData));
     MallocMetaData *newp_metadata;
-
+    size_t old_size = oldp_metadata->size;
 
     if (meta_list.getBinIndex(oldp_metadata->size) != MMAP_BIN) {
-        {
-            /* A. trying to use same block */
-            if (oldp_metadata->size >= new_size) {
+
+        /* A. trying to use same block */
+        if (oldp_metadata->size >= new_size) {
+            newp_metadata = oldp_metadata;
+            if(checkSplit(oldp_metadata, new_size)) {
                 newp_metadata = meta_list.splitBlock(oldp_metadata, new_size);
-                char *p2 = (char *) (newp_metadata);
-                return (void *) (p2 + sizeof(MallocMetaData));
             }
-            size_t left_size = 0;
-            size_t right_size = 0;
-            /* B. trying to mergeLeft */
-            if (oldp_metadata->prev and oldp_metadata->prev->is_free) {
-                left_size = oldp_metadata->prev->size;
-
-                /*              Block size after merge will be left size + old size +
-                 *                      + size of metadata (currently 2 metadata for 2 blocks) */
-                if (new_size <= oldp_metadata->size + left_size + sizeof(MallocMetaData)) {
-                    newp_metadata = oldp_metadata->prev;
-
-                    oldp_metadata->is_free = true; // for asserting reasons
-                    meta_list.mergeLeft(oldp_metadata->prev, oldp_metadata);
-
-                    meta_list.occupyBlock(oldp_metadata->prev);
-                    /* Split the remaining (if there are)*/
-                    newp_metadata = meta_list.splitBlock(newp_metadata, new_size);
-                    char *p2 = (char *) (newp_metadata);
-                    return (void *) (p2 + sizeof(MallocMetaData));
-                }
-            }
-            /* C. trying to mergeRightAndFree */
-            if (oldp_metadata->next and oldp_metadata->next->is_free) {
-                right_size = oldp_metadata->next->size;
-
-                if (new_size <= oldp_metadata->size + right_size + sizeof(MallocMetaData)) {
-                    meta_list.mergeRightAndFree(oldp_metadata, oldp_metadata->next);
-                    meta_list.occupyBlock(oldp_metadata);
-                    newp_metadata = oldp_metadata;
-                    /* Split the remaining (if there are)*/
-                    newp_metadata = meta_list.splitBlock(newp_metadata, new_size);
-                    char *p2 = (char *) (newp_metadata);
-                    return (void *) (p2 + sizeof(MallocMetaData));
-                }
-            }
-            /* D. trying to mergeBoth */
-            if (left_size != 0 and   // means there is a left
-                right_size != 0 and  // means there is a right
-                new_size <= left_size + oldp_metadata->size + right_size + 2 * sizeof(MallocMetaData)) {
-
-                meta_list.mergeRightAndFree(oldp_metadata, oldp_metadata->next);
-                meta_list.occupyBlock(oldp_metadata);
-                newp_metadata = oldp_metadata->prev;
-                meta_list.mergeLeft(oldp_metadata->prev, oldp_metadata);
-                meta_list.occupyBlock(newp_metadata);
-                /* Split the remaining (if there are)*/
+            char *p2 = (char *) (newp_metadata);
+            return (void *) (p2 + sizeof(MallocMetaData));
+        }
+        size_t left_size = 0;
+        size_t right_size = 0;
+        /* B. trying to mergeLeft */
+        if(checkMergeLeft(oldp_metadata, new_size)) {
+            newp_metadata = oldp_metadata->prev;
+            meta_list.mergeLeft(oldp_metadata->prev, oldp_metadata);
+            meta_list.occupyBlock(newp_metadata);
+            if(checkSplit(newp_metadata, new_size)) {
                 newp_metadata = meta_list.splitBlock(newp_metadata, new_size);
-                char *p2 = (char *) (newp_metadata);
-                return (void *) (p2 + sizeof(MallocMetaData));
             }
+            char *p2 = (char *)(newp_metadata);
+            void* newp =  (void *) (p2 + sizeof(MallocMetaData));
+            memcpy(newp, oldp, std::min(old_size,new_size));
+            return newp;
+        }
+        /* C. trying to mergeRight */
+        if (checkMergeRight(oldp_metadata, new_size)) {
+            newp_metadata = oldp_metadata;
+            meta_list.mergeRight(oldp_metadata, oldp_metadata->next);
+            meta_list.occupyBlock(newp_metadata);
+            if(checkSplit(newp_metadata, new_size)) {
+                newp_metadata = meta_list.splitBlock(newp_metadata, new_size);
+            }
+            char *p2 = (char *)(newp_metadata);
+            void* newp =  (void *)(p2 + sizeof(MallocMetaData));
+//                memcpy(newp, oldp, std::min(old_size,new_size)); // no need for that
+            return newp;
+        }
+
+        /* D. trying to mergeBoth */
+        if (checkMergeBoth(oldp_metadata,new_size)) {
+            newp_metadata = oldp_metadata->prev;
+            meta_list.mergeRight(oldp_metadata, oldp_metadata->next);
+            meta_list.mergeLeft(oldp_metadata->prev, oldp_metadata);
+            meta_list.occupyBlock(newp_metadata);
+            if(checkSplit(newp_metadata, new_size)) {
+                newp_metadata = meta_list.splitBlock(newp_metadata, new_size);
+            }
+            char *p2 = (char *)(newp_metadata);
+            void* newp =  (void *) (p2 + sizeof(MallocMetaData));
+            memcpy(newp, oldp, std::min(old_size,new_size));
+            return newp;
         }
 
 
-    }
-    /*
-     * IF ARRIVED HERE:
-     * 1. NEW_SIZE REQUIRES AN MMAP ALLOCATION
-     * 2. THERE ISNT A FREE BLOCK IN BIN LIST ELIGIBLE FOR NEW SIZE --> MAKE A NEW ONE.
-     *  IN BOTH CASES SMALLOC WILL DO THE RIGHT THING.
-     */
 
-/* E+F: Find/Allocate an other block */
-    void *newp = smalloc(new_size);
+    }
+/*
+ * IF ARRIVED HERE:
+ * 1. NEW_SIZE REQUIRES AN MMAP ALLOCATION
+ * 2. THERE ISNT A FREE BLOCK IN BIN LIST ELIGIBLE FOR NEW SIZE --> MAKE A NEW ONE.
+ *  IN BOTH CASES SMALLOC WILL DO THE RIGHT THING.
+ */
+    void* newp;
+
+/* E+F: Find/Allocate an other block (Maybe extending wilderness?) */
+    if(meta_list.getBinIndex(old_size) != MMAP_BIN) {
+// if its the wilderness allow allocateBlock to extend it
+        int flag = (oldp_metadata == meta_list.WILDERNESS) ?  ENABLE_WILDERNESS_EXTEND : DISABLE_WILDERNESS_EXTEND;
+
+        newp_metadata = meta_list.allocateBlock(new_size, flag);
+        if(newp_metadata == nullptr) {
+            return nullptr;
+        }
+
+        char* p2 = (char*)(newp_metadata);
+        newp = (void*)(p2 + sizeof(MallocMetaData));
+        if(oldp == newp) {
+// data werent really reallocated
+            return newp;
+        }
+        memcpy(newp, oldp, std::min(old_size,new_size));
+/* Free old */
+        sfree(oldp);
+        return newp;
+    }
+
+/*  This is an MMAPed block*/
+    newp = smalloc(new_size);
 /* If allocation failed return NULL and dont free oldp */
     if (newp == nullptr) {
         return nullptr;
     }
-    memcpy(newp, oldp, oldp_metadata->size);
-
+    memcpy(newp, oldp, std::min(old_size,new_size));
 /* Free old */
     sfree(oldp);
-
     return newp;
 }
+
+bool checkMergeLeft(MallocMetaData *block, size_t new_size) {
+    return block->prev and
+           block->prev->is_free and
+           (new_size <= block->prev->size + sizeof(MallocMetaData) + block->size);
+}
+bool checkMergeRight(MallocMetaData *block, size_t new_size) {
+    return block->next and
+           block->next->is_free and
+           (new_size <= block->next->size + sizeof(MallocMetaData) + block->size);
+}
+bool checkMergeBoth(MallocMetaData *block, size_t new_size) {
+    return block->next and
+           block->prev and
+           block->next->is_free and
+           block->prev->is_free and
+           (new_size <= block->prev->size + block->next->size + 2* sizeof(MallocMetaData) + block->size);
+}
+
+bool checkSplit(MallocMetaData *block, size_t new_size) {
+    return block->size > new_size + sizeof(MallocMetaData);
+}
+
 size_t _num_free_blocks() {
     return meta_list.num_free_blocks;
 }

@@ -22,7 +22,7 @@ public:
     size_t total_blocks;
     bool isEmpty() const;
     bool isSingleBlock() const;
-    MallocMetaData* allocateBlock(size_t size);
+    MallocMetaData *allocateBlock(size_t size, int flag);
     MallocMetaData* searchFreeBlock(size_t size);
     void freeBlock(MallocMetaData* p);
 };
@@ -31,7 +31,7 @@ public:
  * @param size
  * @return nullptr if there isnt a compatible block and sbrk() fails to add another block. (or size is 0 / bigger than 1e8)
  */
-MallocMetaData* BlockMetaDataList::allocateBlock(size_t size) {
+MallocMetaData * BlockMetaDataList::allocateBlock(size_t size, int flag) {
     if(size == 0 or size > 1e8) {
         return nullptr;
     }
